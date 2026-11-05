@@ -141,6 +141,7 @@ class StreamRunner(BaseRunner):
         progress: Callable[[str], None] | None = None,
         segment_writer=None,
         output_frame_limit: int | None = None,
+        total_source_frames: int | None = None,
     ) -> RunnerOutput:
         input_stream = lq_video if isinstance(lq_video, TemporalVideoStream) else None
         if input_stream is not None:
@@ -239,6 +240,22 @@ class StreamRunner(BaseRunner):
                 for index in range(process_count)
             )
         )
+
+        total_frames = (
+            total_source_frames
+            or (output_frame_limit if output_frame_limit and output_frame_limit > 0 else None)
+            or (getattr(input_stream, "source_frames", None) if getattr(input_stream, "source_frames", 0) > 0 else None)
+            or (frames if frames > 1 else None)
+        )
+        tc = getattr(self.config, "temporal_compression", 2)
+        comp_ratio = max(1, TEMPORAL_DOWNSAMPLE // tc)
+        frames_per_chunk = chunk_latents * comp_ratio
+        if total_frames and total_frames > 0:
+            est_total_chunks = max(1, (total_frames + frames_per_chunk - 1) // frames_per_chunk)
+        else:
+            est_total_chunks = process_count if process_count and process_count > 0 else None
+
+        t_loop = time.time()
         produced_frames = 0
         try:
             for process_index, projection_chunk, frame_offset, last_chunk in chunks:
@@ -272,6 +289,22 @@ class StreamRunner(BaseRunner):
                 pending_latents.append(denoised_chunk.detach().to("cpu"))
                 pending_count += denoised_chunk.shape[2]
                 del conditions, current, prediction, denoised_chunk
+
+                chunk_idx = process_index + 1
+                if progress is not None:
+                    elapsed = max(0.001, time.time() - t_loop)
+                    if est_total_chunks and total_frames:
+                        pct = min(99.0, (chunk_idx / est_total_chunks) * 100)
+                        est_done = min(total_frames, int(round((chunk_idx / est_total_chunks) * total_frames)))
+                        fps_val = est_done / elapsed
+                        progress(
+                            f"Denoising chunk {chunk_idx}/{est_total_chunks} (~{est_done}/{total_frames} frames, {pct:.1f}%) — {fps_val:.2f} FPS"
+                        )
+                    elif est_total_chunks:
+                        pct = min(99.0, (chunk_idx / est_total_chunks) * 100)
+                        progress(f"Denoising chunk {chunk_idx}/{est_total_chunks} ({pct:.1f}%) — elapsed {elapsed:.1f}s")
+                    else:
+                        progress(f"Denoising chunk {chunk_idx} — elapsed {elapsed:.1f}s")
                 if decode_limit is not None and pending_count >= decode_limit and not last_chunk:
                     segment = torch.cat(pending_latents, dim=2)
                     start = max(0, 4 * decoded_latent_offset - 3)
@@ -328,10 +361,10 @@ class StreamRunner(BaseRunner):
                         segment_label = str(segment_number)
                         if total_decode_segments is not None:
                             segment_label += f"/{total_decode_segments}"
+                        tot_disp = f"/{total_frames}" if total_frames else ""
                         progress(
-                            f"Decode segment {segment_label} "
-                            f"· {segment.shape[2]} latent · "
-                            f"{segment_video.shape[2]} output frames"
+                            f"Decoded segment {segment_label} "
+                            f"({produced_frames}{tot_disp} output frames saved)"
                         )
                     decoded_latent_offset += segment.shape[2]
                     pending_latents.clear()

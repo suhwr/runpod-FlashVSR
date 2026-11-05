@@ -106,11 +106,24 @@ class FlashVSRInferencePipeline:
             writer = IncrementalVideoWriter(
                 encoded_path, fps, preset=video_preset
             )
+        total_source_frames = None
+        if request.input_path is not None:
+            try:
+                cap_probe = cv2.VideoCapture(str(Path(request.input_path).expanduser()))
+                if cap_probe.isOpened():
+                    total_source_frames = int(cap_probe.get(cv2.CAP_PROP_FRAME_COUNT))
+                cap_probe.release()
+            except Exception:
+                pass
+        elif request.lq_video is not None:
+            total_source_frames = request.lq_video.shape[2]
+
         try:
             output = self.runner.run(
                 model_input, request.context, progress=progress,
                 segment_writer=writer,
                 output_frame_limit=(expansion.source_frames if writer is not None and expansion is not None else None),
+                total_source_frames=total_source_frames,
             )
         except Exception:
             if writer is not None:

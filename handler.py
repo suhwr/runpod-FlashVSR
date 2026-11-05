@@ -8,12 +8,15 @@ Zero cold-start delay, lossless audio preservation, and multi-fallback uploader.
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
+import mimetypes
 import os
 import shutil
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -76,17 +79,145 @@ def initialize_global_pipeline():
 
 
 # ==============================================================================
-# Multi-Destination Public Cloud Media Uploader
+# Multi-Destination Cloud Media Uploader (Backblaze B2 Primary -> Fallbacks)
 # ==============================================================================
-def upload_file_resilient(file_path: str, destination: str = "auto") -> Optional[str]:
+def upload_b2(file_path: str, folder: str = "flashvsr") -> str:
+    """Upload to Backblaze B2 (boto3 S3 API or native B2 REST API)."""
+    key_id = os.environ.get("B2_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID")
+    app_key = os.environ.get("B2_APPLICATION_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+    bucket = os.environ.get("B2_BUCKET_NAME")
+    endpoint = os.environ.get("B2_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT_URL")
+
+    if not (key_id and app_key and bucket):
+        raise ValueError("Backblaze B2 credentials (B2_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_NAME) not set")
+
+    fname = os.path.basename(file_path)
+    clean_folder = folder.strip("/")
+    target_key = f"{clean_folder}/{int(time.time())}_{uuid.uuid4().hex[:8]}_{fname}"
+    content_type, _ = mimetypes.guess_type(str(file_path))
+    if not content_type:
+        content_type = "video/mp4"
+
+    # Attempt 1: boto3 S3 API if endpoint is provided
+    if endpoint:
+        try:
+            import boto3
+            from botocore.config import Config
+
+            s3 = boto3.client(
+                "s3",
+                endpoint_url=endpoint,
+                aws_access_key_id=key_id,
+                aws_secret_access_key=app_key,
+                config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+            )
+            with open(file_path, "rb") as f:
+                s3.upload_fileobj(f, bucket, target_key, ExtraArgs={"ContentType": content_type})
+
+            public_prefix = os.environ.get("B2_PUBLIC_URL_PREFIX", "").rstrip("/")
+            if public_prefix:
+                return f"{public_prefix}/{target_key}"
+
+            try:
+                return s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": target_key}, ExpiresIn=86400 * 7)
+            except Exception:
+                parsed = urllib.parse.urlsplit(endpoint)
+                return f"{parsed.scheme}://{bucket}.{parsed.netloc}/{target_key}"
+        except ImportError:
+            pass
+
+    # Attempt 2: B2 Native REST API (Zero extra dependencies)
+    auth_resp = requests.get(
+        "https://api.backblazeb2.com/b2api/v3/b2_authorize_account",
+        auth=(key_id, app_key),
+        timeout=30,
+    )
+    auth_resp.raise_for_status()
+    auth_data = auth_resp.json()
+    api_url = auth_data["apiUrl"]
+    auth_token = auth_data["authorizationToken"]
+    download_url = auth_data["downloadUrl"]
+
+    bucket_id = os.environ.get("B2_BUCKET_ID")
+    if not bucket_id:
+        bucket_id = auth_data.get("allowed", {}).get("bucketId")
+    if not bucket_id:
+        lb_resp = requests.post(
+            f"{api_url}/b2api/v3/b2_list_buckets",
+            headers={"Authorization": auth_token},
+            json={"accountId": auth_data["accountId"], "bucketName": bucket},
+            timeout=30,
+        )
+        lb_resp.raise_for_status()
+        buckets = lb_resp.json().get("buckets", [])
+        if buckets:
+            bucket_id = buckets[0]["bucketId"]
+        else:
+            raise ValueError(f"B2 bucket '{bucket}' not found")
+
+    up_resp = requests.post(
+        f"{api_url}/b2api/v3/b2_get_upload_url",
+        headers={"Authorization": auth_token},
+        json={"bucketId": bucket_id},
+        timeout=30,
+    )
+    up_resp.raise_for_status()
+    up_data = up_resp.json()
+    upload_url = up_data["uploadUrl"]
+    upload_token = up_data["authorizationToken"]
+
+    sha1 = hashlib.sha1()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(65536):
+            sha1.update(chunk)
+    digest = sha1.hexdigest()
+
+    file_size = os.path.getsize(file_path)
+    with open(file_path, "rb") as f:
+        res = requests.post(
+            upload_url,
+            headers={
+                "Authorization": upload_token,
+                "X-Bz-File-Name": urllib.parse.quote(target_key),
+                "Content-Type": content_type,
+                "Content-Length": str(file_size),
+                "X-Bz-Content-Sha1": digest,
+            },
+            data=f,
+            timeout=180,
+        )
+        res.raise_for_status()
+
+    public_prefix = os.environ.get("B2_PUBLIC_URL_PREFIX", "").rstrip("/")
+    if public_prefix:
+        return f"{public_prefix}/{target_key}"
+    return f"{download_url}/file/{bucket}/{target_key}"
+
+
+def upload_file_resilient(file_path: str, destination: str = "auto") -> Tuple[Optional[str], str]:
     """Robust multi-cloud uploader with fallback sequence."""
     if not os.path.isfile(file_path) or os.path.getsize(file_path) == 0:
-        return None
+        return None, "none"
 
     filename = os.path.basename(file_path)
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
-    # 1. Try Uguu.se (up to 128MB)
+    # 1. Backblaze B2 (Primary destination if configured or explicitly requested)
+    has_b2 = (
+        (os.environ.get("B2_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID"))
+        and (os.environ.get("B2_APPLICATION_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY"))
+        and os.environ.get("B2_BUCKET_NAME")
+    )
+    if destination in ("auto", "b2", "backblaze") and has_b2:
+        try:
+            url = upload_b2(file_path, folder="flashvsr")
+            if url:
+                print(f"✅ Uploaded to Backblaze B2: {url}", flush=True)
+                return url, "backblaze_b2"
+        except Exception as e:
+            print(f"⚠️ Backblaze B2 upload failed ({e}), falling back to public hosts...", flush=True)
+
+    # 2. Try Uguu.se (up to 128MB)
     if destination in ("auto", "uguu") and file_size_mb <= 128:
         try:
             with open(file_path, "rb") as f:
@@ -96,11 +227,12 @@ def upload_file_resilient(file_path: str, destination: str = "auto") -> Optional
                 if data.get("success") and data.get("files"):
                     url = data["files"][0].get("url")
                     if url:
-                        return url
+                        print(f"✅ Uploaded to Uguu.se: {url}", flush=True)
+                        return url, "uguu"
         except Exception as e:
             print(f"⚠️ Uguu upload failed ({e}), trying fallback...", flush=True)
 
-    # 2. Try Catbox.moe / Litterbox (up to 1GB)
+    # 3. Try Catbox.moe / Litterbox (up to 1GB)
     if destination in ("auto", "catbox", "litterbox") and file_size_mb <= 1024:
         try:
             with open(file_path, "rb") as f:
@@ -111,20 +243,24 @@ def upload_file_resilient(file_path: str, destination: str = "auto") -> Optional
                     timeout=90,
                 )
             if res.status_code == 200 and res.text.strip().startswith("http"):
-                return res.text.strip()
+                url = res.text.strip()
+                print(f"✅ Uploaded to Litterbox: {url}", flush=True)
+                return url, "catbox"
         except Exception as e:
             print(f"⚠️ Litterbox upload failed ({e}), trying fallback...", flush=True)
 
-    # 3. Try 0x0.st
+    # 4. Try 0x0.st
     try:
         with open(file_path, "rb") as f:
             res = requests.post("https://0x0.st", files={"file": (filename, f)}, timeout=60)
         if res.status_code == 200 and res.text.strip().startswith("http"):
-            return res.text.strip()
+            url = res.text.strip()
+            print(f"✅ Uploaded to 0x0.st: {url}", flush=True)
+            return url, "0x0.st"
     except Exception as e:
         print(f"⚠️ 0x0.st upload failed ({e})", flush=True)
 
-    return None
+    return None, "none"
 
 
 # ==============================================================================
@@ -200,6 +336,10 @@ def handler(job: dict) -> dict:
     if temporal_compression not in (1, 2, 4):
         temporal_compression = 4
 
+    clean_target = str(target_res).lower().strip()
+    default_offload = "never" if clean_target in ("720p", "sd", "1080p", "fhd", "hd", "2k", "qhd", "1440p") else "auto"
+    cache_offload_mode = str(job_input.get("cache_offload_mode", default_offload)).strip().lower()
+
     decode_every = job_input.get("decode_every", 28)
     color_correction = bool(job_input.get("color_correction", False) or job_input.get("cf", False))
     upload_dest = str(job_input.get("upload_destination", "auto")).strip().lower()
@@ -256,9 +396,10 @@ def handler(job: dict) -> dict:
         if (
             PIPELINE is None
             or PIPELINE.config.temporal_compression != temporal_compression
+            or getattr(PIPELINE.config, "stream_cache_offload_mode", "auto") != cache_offload_mode
             or PIPELINE.config.color_correction.enabled != color_correction
         ):
-            print(f"[{job_id}] Initializing FlashVSR+ pipeline (mode={mode}, temporal_comp={temporal_compression})...", flush=True)
+            print(f"[{job_id}] Initializing FlashVSR+ pipeline (mode={mode}, temporal_comp={temporal_compression}, offload={cache_offload_mode})...", flush=True)
             config = stream_config_for_mode(
                 mode,
                 device=ACTIVE_DEVICE,
@@ -266,6 +407,7 @@ def handler(job: dict) -> dict:
                 hardware_profile="auto",
                 attn_kernel="auto",
                 temporal_compression=temporal_compression,
+                cache_offload_mode=cache_offload_mode,
                 color_correction=color_correction,
             )
             paths = model_paths_for_mode(ROOT_DIR, mode)
@@ -283,8 +425,12 @@ def handler(job: dict) -> dict:
             width=out_w,
         )
 
+        def on_progress(msg: str):
+            print(f"[{job_id}] {msg}", flush=True)
+
         result = pipeline.infer(
             req,
+            progress=on_progress,
             video_preset=video_preset,
         )
 
@@ -305,7 +451,7 @@ def handler(job: dict) -> dict:
         out_name = f"flashvsr_{target_res}_{job_id}.mp4"
 
         print(f"[{job_id}] Uploading output video ({file_size / (1024*1024):.2f} MB)...", flush=True)
-        file_url = upload_file_resilient(output_video_path, destination=upload_dest)
+        file_url, storage_provider = upload_file_resilient(output_video_path, destination=upload_dest)
 
         if not file_url:
             # Fallback to base64 if cloud upload fails
@@ -328,6 +474,7 @@ def handler(job: dict) -> dict:
         return {
             "status": "COMPLETED",
             "url": file_url,
+            "storage": storage_provider,
             "file_name": out_name,
             "input_resolution": f"{in_w}x{in_h}",
             "output_resolution": f"{out_w}x{out_h}",
