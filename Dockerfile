@@ -10,9 +10,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_PREFER_BINARY=1 \
     CUDA_MODULE_LOADING=LAZY \
-    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;10.0;12.0+PTX" \
+    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX" \
     PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
-    PYTHONPATH="/app:${PYTHONPATH}" \
+    PYTHONPATH="/app:/app/operators/flashvsr_attn:${PYTHONPATH}" \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 
 # 1. Install system tools, ffmpeg, build packages, and Python 3.11
@@ -53,7 +53,7 @@ RUN python3 -m pip install --no-cache-dir \
     --extra-index-url https://download.pytorch.org/whl/cu128 \
     -r /app/requirements.txt
 
-# 4. Copy FlashVSR+ framework code and install package
+# 4. Copy FlashVSR+ framework code and install packages (including Triton block sparse attention kernel)
 COPY pyproject.toml /app/pyproject.toml
 COPY flashvsr_plus /app/flashvsr_plus
 COPY inference /app/inference
@@ -61,7 +61,8 @@ COPY model_io /app/model_io
 COPY models /app/models
 COPY operators /app/operators
 COPY prompt_tensor /app/prompt_tensor
-RUN python3 -m pip install --no-cache-dir -e /app --no-deps
+RUN python3 -m pip install --no-cache-dir -e /app --no-deps \
+    && python3 -m pip install --no-cache-dir -e /app/operators/flashvsr_attn --no-deps
 
 # 5. Pre-bake model weights during build (0ms cold-start latency)
 COPY download_models.py /app/download_models.py

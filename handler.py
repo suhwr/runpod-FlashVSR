@@ -23,10 +23,14 @@ import requests
 import runpod
 import torch
 
-# Add current directory to sys.path so inference and flashvsr_plus packages import cleanly
+# Add current directory and Triton operator directory to sys.path
 ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+
+TRITON_OP_DIR = str(ROOT_DIR / "operators" / "flashvsr_attn")
+if TRITON_OP_DIR not in sys.path:
+    sys.path.insert(0, TRITON_OP_DIR)
 
 from inference import InferenceRequest, build_inference_pipeline
 from inference.presets import model_paths_for_mode, stream_config_for_mode
@@ -247,15 +251,14 @@ def handler(job: dict) -> dict:
             flush=True,
         )
 
-        # 5. Build or Reconfigure Pipeline
-        # If parameters differ from pre-warmed default, construct config
-        pipeline = PIPELINE
+        # 5. Build or Reconfigure Pipeline (Cached across jobs)
+        global PIPELINE
         if (
-            pipeline is None
-            or pipeline.config.temporal_compression != temporal_compression
-            or pipeline.config.color_correction.enabled != color_correction
+            PIPELINE is None
+            or PIPELINE.config.temporal_compression != temporal_compression
+            or PIPELINE.config.color_correction.enabled != color_correction
         ):
-            print(f"[{job_id}] Reconfiguring FlashVSR+ pipeline for job parameters...", flush=True)
+            print(f"[{job_id}] Initializing FlashVSR+ pipeline (mode={mode}, temporal_comp={temporal_compression})...", flush=True)
             config = stream_config_for_mode(
                 mode,
                 device=ACTIVE_DEVICE,
@@ -266,7 +269,8 @@ def handler(job: dict) -> dict:
                 color_correction=color_correction,
             )
             paths = model_paths_for_mode(ROOT_DIR, mode)
-            pipeline = build_inference_pipeline(config, paths)
+            PIPELINE = build_inference_pipeline(config, paths)
+        pipeline = PIPELINE
 
         # 6. Run Inference
         t_infer = time.time()
@@ -353,10 +357,6 @@ def handler(job: dict) -> dict:
 # ==============================================================================
 if __name__ == "__main__":
     print("⚡ [FlashVSR+] Starting RunPod Serverless Container Worker...", flush=True)
-    # Pre-warm model weights at cold start
-    try:
-        initialize_global_pipeline()
-    except Exception as err:
-        print(f"⚠️ [FlashVSR+] Pre-warming warning: {err} (will retry on first request)", flush=True)
-
+    # Register immediately with RunPod without blocking cold start!
+    # Model pipeline loads lazily on the first incoming job and remains cached in VRAM.
     runpod.serverless.start({"handler": handler})
