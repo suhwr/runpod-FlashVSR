@@ -1,0 +1,12 @@
+torch>=2.5,<2.8
+einops>=0.8
+imageio>=2.37
+imageio-ffmpeg>=0.6
+numpy>=2.0
+opencv-python-headless>=4.10
+Pillow>=10.0
+safetensors>=0.5
+tqdm>=4.66
+huggingface_hub>=0.28
+runpod>=1.7.0
+requests>=2.31.0

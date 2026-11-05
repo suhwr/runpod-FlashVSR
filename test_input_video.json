@@ -1,0 +1,8 @@
+{
+  "input": {
+    "video": "https://h.uguu.se/aeQvRJSD.mp4",
+    "resolution": "1080p",
+    "mode": "turbo",
+    "temporal_compression": 4
+  }
+}
