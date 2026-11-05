@@ -5,6 +5,9 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
+import cv2
+import torch
+
 from inference.config import TEMPORAL_DOWNSAMPLE, InferenceConfig
 from inference.loading import ComponentFactories, ModelBundle, ModelPaths, build_model_bundle
 from inference.output import (
