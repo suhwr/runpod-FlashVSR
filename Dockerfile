@@ -12,6 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_MODULE_LOADING=LAZY \
     TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0;10.0;12.0+PTX" \
     PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
+    PYTHONPATH="/app:${PYTHONPATH}" \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 
 # 1. Install system tools, ffmpeg, build packages, and Python 3.11
@@ -56,6 +57,7 @@ RUN python3 -m pip install --no-cache-dir \
 COPY pyproject.toml /app/pyproject.toml
 COPY flashvsr_plus /app/flashvsr_plus
 COPY inference /app/inference
+COPY model_io /app/model_io
 COPY models /app/models
 COPY operators /app/operators
 COPY prompt_tensor /app/prompt_tensor
