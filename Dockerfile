@@ -68,7 +68,10 @@ RUN python3 -m pip install --no-cache-dir -e /app --no-deps \
 COPY download_models.py /app/download_models.py
 RUN python3 /app/download_models.py
 
-# 6. Copy handler & docs
+# 6. Copy Real-CUGAN weights, architecture, handler & docs
+COPY weights_v3 /app/weights_v3
+COPY upcunet_v3.py /app/upcunet_v3.py
+COPY cugan_pipeline.py /app/cugan_pipeline.py
 COPY handler.py /app/handler.py
 COPY README.md /app/README.md
 

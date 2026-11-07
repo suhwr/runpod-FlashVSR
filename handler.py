@@ -273,39 +273,29 @@ def calculate_target_resolution(in_w: int, in_h: int, target_res: str, scale: Op
     """
     clean_res = str(target_res).lower().strip()
 
-    # Predefined presets
+    # Predefined presets (Strictly 720p and 1080p, no 2K or 4K to prevent OOM/high bills)
     if clean_res in ("720p", "sd"):
         if in_w >= in_h:  # Landscape
             return 1280, 768
         else:  # Portrait
             return 768, 1280
 
-    if clean_res in ("1080p", "fhd", "hd", "default"):
+    if clean_res in ("1080p", "fhd", "hd", "default", "2k", "qhd", "1440p", "4k", "uhd", "ultra"):
         if in_w >= in_h:
             return 1920, 1024
         else:
             return 1024, 1920
 
-    if clean_res in ("2k", "qhd", "1440p"):
-        if in_w >= in_h:
-            return 2560, 1408
-        else:
-            return 1408, 2560
-
-    if clean_res in ("4k", "uhd", "ultra"):
-        if in_w >= in_h:
-            return 3840, 2048
-        else:
-            return 2048, 3840
-
-    # Custom scale multiplier (e.g. 2x, 3x, 4x)
+    # Custom scale multiplier clamped to max 1080p equivalent
     eff_scale = scale if scale in (2, 3, 4) else 2
-    raw_w = in_w * eff_scale
-    raw_h = in_h * eff_scale
+    raw_w = min(1920, in_w * eff_scale)
+    raw_h = min(1080, in_h * eff_scale)
 
     # Snap to closest multiple of 128 (minimum 256)
     target_w = max(256, int(round(raw_w / 128.0) * 128))
     target_h = max(256, int(round(raw_h / 128.0) * 128))
+
+    return target_w, target_h
 
     return target_w, target_h
 
@@ -320,6 +310,7 @@ def handler(job: dict) -> dict:
     print(f"\n⚡ [{job_id}] Received FlashVSR+ job request", flush=True)
 
     # 1. Parse Input Parameters
+    model = str(job_input.get("model", job_input.get("engine", "flashvsr"))).strip().lower()
     raw_media = (
         job_input.get("video")
         or job_input.get("url")
@@ -331,6 +322,7 @@ def handler(job: dict) -> dict:
 
     target_res = str(job_input.get("resolution", job_input.get("target_resolution", "1080p"))).strip()
     scale = int(job_input.get("scale", 2))
+    target_fps = int(job_input.get("fps", 30))
     mode = str(job_input.get("mode", "turbo")).strip().lower()
     temporal_compression = int(job_input.get("temporal_compression", 4))
     if temporal_compression not in (1, 2, 4):
@@ -383,72 +375,113 @@ def handler(job: dict) -> dict:
         if in_w <= 0 or in_h <= 0:
             return {"error": "Invalid video stream: could not read dimensions"}
 
-        out_w, out_h = calculate_target_resolution(in_w, in_h, target_res, scale=scale)
-
-        print(
-            f"[{job_id}] Video Info: {in_w}x{in_h} @ {fps:.2f}fps ({total_frames} frames) -> Target: {out_w}x{out_h} "
-            f"(mode={mode}, temporal_comp={temporal_compression})",
-            flush=True,
-        )
-
-        # 5. Build or Reconfigure Pipeline (Cached across jobs)
-        global PIPELINE
-        if (
-            PIPELINE is None
-            or PIPELINE.config.temporal_compression != temporal_compression
-            or getattr(PIPELINE.config, "stream_cache_offload_mode", "auto") != cache_offload_mode
-            or PIPELINE.config.color_correction.enabled != color_correction
-        ):
-            print(f"[{job_id}] Initializing FlashVSR+ pipeline (mode={mode}, temporal_comp={temporal_compression}, offload={cache_offload_mode})...", flush=True)
-            config = stream_config_for_mode(
-                mode,
-                device=ACTIVE_DEVICE,
-                decode_every=decode_every,
-                hardware_profile="auto",
-                attn_kernel="auto",
-                temporal_compression=temporal_compression,
-                cache_offload_mode=cache_offload_mode,
-                color_correction=color_correction,
+        # 5. Branch: Real-CUGAN Pipeline (Ultra-fast Anime upscaling)
+        if model in ("cugan", "anime", "real-cugan", "waifu"):
+            print(f"[{job_id}] Executing Real-CUGAN anime upscaling pipeline...", flush=True)
+            from cugan_pipeline import get_cugan_upscaler, calculate_cugan_dimensions, process_cugan_video
+            out_w, out_h, chosen_scale = calculate_cugan_dimensions(in_w, in_h, target_res, user_scale=scale)
+            denoise = str(job_input.get("denoise", "conservative")).strip().lower()
+            upscaler = get_cugan_upscaler(scale=chosen_scale, denoise=denoise, half=True)
+            stats = process_cugan_video(
+                input_path=input_video_path,
+                output_path=output_video_path,
+                upscaler=upscaler,
+                scale=chosen_scale,
+                out_w=out_w,
+                out_h=out_h,
+                custom_fps=target_fps,
+                crf=18,
+                batch_size=2,
+                job_id=job_id,
             )
-            paths = model_paths_for_mode(ROOT_DIR, mode)
-            PIPELINE = build_inference_pipeline(config, paths)
-        pipeline = PIPELINE
+            frames_done = stats.get("frames_processed", total_frames)
+            fps_proc = stats.get("fps_processing", 0.0)
 
-        # 6. Run Inference
-        t_infer = time.time()
-        print(f"[{job_id}] Starting FlashVSR+ video super-resolution...", flush=True)
+        # 6. Branch: FlashVSR+ Pipeline (Realistic / Cinematic Video Super-Resolution)
+        else:
+            # Auto-clamp FPS to 30 unless 60fps explicitly requested (saves 50% GPU time)
+            if fps > 35.0 and target_fps <= 30:
+                clamped_input = os.path.join(temp_dir, f"clamped_30fps_{job_id}.mp4")
+                print(f"[{job_id}] Video FPS is {fps:.1f} > 30: clamping to 30 FPS to optimize GPU time...", flush=True)
+                import subprocess
+                clamp_cmd = [
+                    "ffmpeg", "-y", "-i", input_video_path,
+                    "-r", "30",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "15",
+                    "-c:a", "copy",
+                    clamped_input
+                ]
+                res = subprocess.run(clamp_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if res.returncode == 0 and os.path.isfile(clamped_input) and os.path.getsize(clamped_input) > 0:
+                    input_video_path = clamped_input
+                    fps = 30.0
 
-        req = InferenceRequest(
-            input_path=input_video_path,
-            output_path=output_video_path,
-            height=out_h,
-            width=out_w,
-        )
+            out_w, out_h = calculate_target_resolution(in_w, in_h, target_res, scale=scale)
 
-        def on_progress(msg: str):
-            print(f"[{job_id}] {msg}", flush=True)
+            print(
+                f"[{job_id}] FlashVSR Info: {in_w}x{in_h} @ {fps:.2f}fps ({total_frames} frames) -> Target: {out_w}x{out_h} "
+                f"(mode={mode}, temporal_comp={temporal_compression})",
+                flush=True,
+            )
 
-        result = pipeline.infer(
-            req,
-            progress=on_progress,
-            video_preset=video_preset,
-        )
+            # Build or Reconfigure Pipeline (Cached across jobs)
+            global PIPELINE
+            if (
+                PIPELINE is None
+                or PIPELINE.config.temporal_compression != temporal_compression
+                or getattr(PIPELINE.config, "stream_cache_offload_mode", "auto") != cache_offload_mode
+                or PIPELINE.config.color_correction.enabled != color_correction
+            ):
+                print(f"[{job_id}] Initializing FlashVSR+ pipeline (mode={mode}, temporal_comp={temporal_compression}, offload={cache_offload_mode})...", flush=True)
+                config = stream_config_for_mode(
+                    mode,
+                    device=ACTIVE_DEVICE,
+                    decode_every=decode_every,
+                    hardware_profile="auto",
+                    attn_kernel="auto",
+                    temporal_compression=temporal_compression,
+                    cache_offload_mode=cache_offload_mode,
+                    color_correction=color_correction,
+                )
+                paths = model_paths_for_mode(ROOT_DIR, mode)
+                PIPELINE = build_inference_pipeline(config, paths)
+            pipeline = PIPELINE
 
-        infer_duration = time.time() - t_infer
-        frames_done = result.frames if result.frames > 0 else total_frames
-        fps_proc = frames_done / max(0.001, infer_duration)
+            # Run FlashVSR Inference
+            t_infer = time.time()
+            print(f"[{job_id}] Starting FlashVSR+ video super-resolution...", flush=True)
 
-        print(
-            f"[{job_id}] Inference complete: {frames_done} frames processed in {infer_duration:.2f}s ({fps_proc:.2f} FPS)",
-            flush=True,
-        )
+            req = InferenceRequest(
+                input_path=input_video_path,
+                output_path=output_video_path,
+                height=out_h,
+                width=out_w,
+            )
+
+            def on_progress(msg: str):
+                print(f"[{job_id}] {msg}", flush=True)
+
+            result = pipeline.infer(
+                req,
+                progress=on_progress,
+                video_preset=video_preset,
+            )
+
+            infer_duration = time.time() - t_infer
+            frames_done = result.frames if result.frames > 0 else total_frames
+            fps_proc = frames_done / max(0.001, infer_duration)
+
+            print(
+                f"[{job_id}] Inference complete: {frames_done} frames processed in {infer_duration:.2f}s ({fps_proc:.2f} FPS)",
+                flush=True,
+            )
 
         # 7. Upload Result
         if not os.path.isfile(output_video_path) or os.path.getsize(output_video_path) == 0:
             return {"error": "Output video was not generated or has zero size"}
 
         file_size = os.path.getsize(output_video_path)
-        out_name = f"flashvsr_{target_res}_{job_id}.mp4"
+        out_name = f"{model}_{target_res}_{job_id}.mp4"
 
         print(f"[{job_id}] Uploading output video ({file_size / (1024*1024):.2f} MB)...", flush=True)
         file_url, storage_provider = upload_file_resilient(output_video_path, destination=upload_dest)
