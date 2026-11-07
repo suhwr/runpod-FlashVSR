@@ -372,6 +372,15 @@ def handler(job: dict) -> dict:
         if in_w <= 0 or in_h <= 0:
             return {"error": "Invalid video stream: could not read dimensions"}
 
+        # Guard: Reject videos already higher than 1080p (> 1090 to account for 1088p encoding)
+        short_edge = min(in_w, in_h)
+        if short_edge > 1090:
+            return {"error": f"Video resolution {in_w}x{in_h} exceeds 1080p limit. Video is already HD (>1080p)."}
+
+        # Guard: If input is sub-720p, enforce target 720p
+        if short_edge < 700:
+            target_res = "720p"
+
         # 5. Auto-clamp FPS to 30 unless 60fps explicitly requested (saves 50% GPU time)
         if fps > 35.0 and target_fps <= 30:
             clamped_input = os.path.join(temp_dir, f"clamped_30fps_{job_id}.mp4")
