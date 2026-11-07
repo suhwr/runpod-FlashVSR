@@ -249,13 +249,12 @@ class StreamRunner(BaseRunner):
             or (getattr(input_stream, "source_frames", None) if getattr(input_stream, "source_frames", 0) > 0 else None)
             or (frames if frames > 1 else None)
         )
-        tc = getattr(self.config, "temporal_compression", 2)
-        comp_ratio = max(1, TEMPORAL_DOWNSAMPLE // tc)
-        frames_per_chunk = chunk_latents * comp_ratio
-        if total_frames and total_frames > 0:
-            est_total_chunks = max(1, (total_frames + frames_per_chunk - 1) // frames_per_chunk)
+        if process_count and process_count > 0:
+            est_total_chunks = process_count
+        elif total_frames and total_frames > 0:
+            est_total_chunks = max(1, (total_frames + chunk_latents * TEMPORAL_DOWNSAMPLE - 1) // (chunk_latents * TEMPORAL_DOWNSAMPLE))
         else:
-            est_total_chunks = process_count if process_count and process_count > 0 else None
+            est_total_chunks = None
 
         t_loop = time.time()
         produced_frames = 0
